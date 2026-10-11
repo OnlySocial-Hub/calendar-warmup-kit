@@ -1,0 +1,8 @@
+node_modules/
+# crash-safe store siblings (store.js)
+*.json.bak
+*.json.tmp-*
+# local state / data the engine writes
+data/
+*.local.json
+.DS_Store

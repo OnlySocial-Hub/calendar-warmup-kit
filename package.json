@@ -1,0 +1,19 @@
+{
+  "name": "calendar-warmup-kit",
+  "version": "1.0.0",
+  "description": "Calendar / posting-schedule + two-week warm-up engine for an iPhone social-automation bot. Phone-agnostic: you inject the two functions that touch a device.",
+  "type": "module",
+  "main": "src/engine.js",
+  "exports": {
+    ".": "./src/engine.js",
+    "./warmup": "./src/warmup.js",
+    "./calendar": "./src/calendar.js",
+    "./sessions": "./src/sessions.js",
+    "./limits": "./src/limits.js",
+    "./posting": "./src/posting.js"
+  },
+  "scripts": {
+    "demo": "node demo.js"
+  },
+  "license": "MIT"
+}
