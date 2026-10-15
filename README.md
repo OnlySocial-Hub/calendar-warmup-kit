@@ -4,21 +4,27 @@ The **calendar, posting-schedule, and two-week warm-up engine** pulled out of a
 working iPhone social-automation farm, as a small, self-contained set of modules
 you can drop into your own bot.
 
-It deliberately contains **only** the "when and how much" brain:
+It contains the **"when, how much, and what"** brain:
 
 - the **warm-up clock** that stops a fresh account posting for ~2 weeks,
 - the **calendar/scheduler** that decides when posts go out,
 - the **session planner** (scroll / AFK / engage / follow / link-in-bio) that
-  fills the rest of the day with human-like activity,
-- the **rate limits** and the **feedback loop** (more views → more activity; a
-  flag → back off),
+  decides which sessions run, when, and how many,
+- the **session behaviour** (`activity.js`) that turns one session into the
+  concrete, timed recipe of actions it performs — watch this reel 14s, pause,
+  like (only sometimes), open a profile, maybe follow, keep scrolling — with the
+  per-item watch times, probabilities, pacing, and budget,
+- the **rate limits** and live per-day counters, plus the **feedback loop** (more
+  views → more activity; a flag → back off),
 - a small **dispatch loop** that fires due posts safely.
 
-It does **not** include any device/automation code — no WebDriverAgent, no
-Instagram tapping, no UI, no accounts/proxy/credential handling. You plug in the
-two functions that actually touch a phone and the engine drives the rest. That's
-the whole point: this is the part that's fiddly to get right (timings, caps, the
-warm-up ramp), separated from the part that's specific to your setup.
+What it does **not** include is the raw **device driving** — the ~9 primitive
+taps that actually press the glass (WebDriverAgent / go-ios), plus any UI,
+accounts/proxy/credential handling. Those sit behind a tiny **device adapter**
+you implement (`openApp`, `watch`, `like`, `follow`, …). The engine builds the
+human-like session recipe and calls your adapter to carry each step out. That's
+the whole point: the fiddly, flag-sensitive part (timings, caps, the warm-up
+ramp, *what a session does*) is here and generic; only the taps are yours.
 
 > This is extracted from a bot that already runs this way. Where this README says
 > "we", it's describing how the full system works around these files (e.g. a
@@ -33,29 +39,37 @@ warm-up ramp), separated from the part that's specific to your setup.
 src/
   warmup.js    the two-week warm-up clock + the ramp phases
   calendar.js  the posting schedule: slots, per-day cap, auto-schedule, "what's due"
-  sessions.js  the session catalogue + the day planner (what happens, when)
+  sessions.js  the session catalogue + the day planner (WHICH session, WHEN, HOW MANY)
+  activity.js  what a session actually DOES: the timed action recipe + the executor
   limits.js    every rate limit + the views→activity maths, in one place
   posting.js   the dispatch loop: fire due posts, one per account, warm only
   engine.js    ties it together; owns state, persists it, exposes a tick() + status()
   store.js     tiny crash-safe JSON persistence (atomic writes)
-demo.js        run the whole thing on a simulated clock with NO phones
+demo.js         run the whole thing on a simulated clock with NO phones
+demo-session.js print ONE session's full action-by-action recipe (what it does)
 ```
 
-Run the demo to see it work end to end (no phones, no setup):
+Two demos, both no-phone, no-setup:
 
 ```bash
-node demo.js
+node demo.js          # the whole calendar over ~22 days (warm-up → posting → ramp)
+node demo-session.js  # one session expanded into its exact timed actions
 ```
 
-You'll watch three accounts warm up for ~2 weeks (no posting), then start
-posting once a day, ramp up as their "views" climb, set a link in bio once
-they've earned it, and one account get "flagged" and automatically back off.
+`demo.js` shows three accounts warm up for ~2 weeks (no posting), then start
+posting once a day, ramp their sessions/likes/follows up as their "views" climb,
+set a link in bio once they've earned it, and one account get "flagged" and back
+off. `demo-session.js` is the "what do the sessions actually do" view — it prints
+a reels scroll, an engagement session, a follow session, a week-one watch-only
+session and an AFK session as concrete, timed action lists.
 
 ---
 
 ## For your Claude Code — how to wire it into your bot
 
-You only have to supply two functions — the ones that drive a phone:
+You supply a small **device adapter** (the taps) and **one post function**. The
+engine builds each session's human-like recipe and calls your adapter to carry it
+out — you don't write any of the "what to do inside a session" logic.
 
 ```js
 import { CalendarEngine } from "./src/engine.js";
@@ -63,12 +77,24 @@ import { CalendarEngine } from "./src/engine.js";
 const engine = new CalendarEngine({
   dataFile: "./data/calendar.json",         // state survives restarts (atomic writes)
 
-  // Run one human session on the phone for this account. Resolve when done.
-  onSession: async (account, session) => {
-    // session.type is one of: scroll_reels | scroll_home | watch_stories |
-    //   search_explore | engagement | follow_list | set_link_in_bio
-    // session.durationMin is how long to run it for.
-    await yourBot.runSession(account.id, session.type, session.durationMin);
+  // The device adapter — the ONLY phone-touching code. The engine fires these in
+  // the right order, with the right timing, to run each session. Every method is
+  // optional and may be async; implement them with your own WDA/go-ios taps.
+  actions: {
+    openApp:     (surface) => yourBot.open(surface),  // 'reels'|'home'|'stories'|'search'|'profiles'
+    watch:       (target, ms) => yourBot.watch(ms),   // dwell on one reel/post for ~ms
+    idle:        (ms) => yourBot.wait(ms),            // AFK watching (stories)
+    like:        () => yourBot.like(),
+    save:        () => yourBot.save(),
+    comment:     (text) => yourBot.comment(text),     // text from your pool / a model
+    openProfile: () => yourBot.openProfile(),
+    follow:      () => yourBot.follow(),
+    back:        () => yourBot.back(),
+    search:      (term) => yourBot.search(term),
+    openResult:  () => yourBot.openFirstResult(),
+    setLinkInBio:() => yourBot.setBioLink(),
+    pause:       (ms) => yourBot.sleep(ms),           // the human rest between taps
+    closeApp:    () => yourBot.home(),
   },
 
   // Publish one post on the phone for this account. Resolve on success, THROW on
@@ -77,6 +103,12 @@ const engine = new CalendarEngine({
     await yourBot.publish(account.id, post.id);   // post.id is yours to map to a clip
   },
 });
+```
+
+> Prefer to drive sessions yourself? Pass `onSession(account, session)` instead of
+> `actions`. `session.script` is the pre-built recipe (an action list) — run it with
+> `runSessionScript(session.script, yourActions)` from `activity.js`, or ignore it
+> and do your own thing with `session.type` / `session.durationMin`.
 
 // 1. When an account/phone is set up, add it — this STARTS its warm-up clock.
 engine.addAccount({ id: udid, label: "@handle" });
@@ -155,6 +187,57 @@ session, rest, run the next, until it either hits the day's session count or run
 past bedtime (in which case the leftover simply doesn't happen — a real person
 doesn't cram).
 
+### What does a session actually *do*? (the code behind it)
+
+`sessions.js` only decides *which* session runs and for how long. The behaviour
+**inside** a session — the part you'd actually watch happen on the phone — lives
+in **`activity.js`**. `buildSessionScript()` turns one session into a concrete,
+ordered, **timed list of actions**, and `runSessionScript()` walks that list and
+calls your device adapter. Run `node demo-session.js` to print real examples; one
+looks like this (a warm account's 6-minute Reels scroll):
+
+```
+00:02  (+2.1s) open_app
+00:04  (+2.2s) watch reel for 13.7s
+00:18  (+0.7s) watch reel for 7.2s
+00:33  (+0.7s) watch reel for 22.9s
+03:00  (+0.5s) like
+03:39  (+0.5s) save
+04:56  (+0.8s) open_profile
+04:57  (+1.3s) back
+06:28  (+0.8s) like
+06:30  (+1.8s) close_app
+   ——— ~6.5 min · 23 watched, 3 liked, 1 saved
+```
+
+Each session type has a **behaviour profile** (`activity.SESSION_BEHAVIOUR`):
+
+- **per-item dwell time** — how long a single reel/post/story is watched (a range,
+  e.g. 5–34s for Reels), with an occasional rewatch,
+- **per-item probabilities** — the chance, *for each item*, of a like, save,
+  comment, opening a profile, or following — and these are **keyed by warm-up
+  phase**, so week one is watch-only, week two adds the odd like, and follows only
+  start in week three. (This is the same ramp the planner uses, but at the action
+  level.) A **follow only happens from an opened profile**, never straight off a
+  feed — like a person.
+- **pacing** — a short human pause before every tap/swipe, so the session has a
+  real tempo rather than firing actions instantly.
+- **the `engagement` session** is the "spicy" one (higher like/comment/follow
+  rates); **`watch_stories`** is pure AFK (watch, basically never touch);
+  **`follow_list`** walks profiles and follows a few.
+
+Crucially, the recipe is **budgeted against the daily caps**: the engine tracks how
+many likes / follows / comments each account has spent today (counters that reset
+at local midnight), and a session is only allowed a slice of what's left — so the
+80 likes / 20 follows / 8 comments ceilings in `limits.js` are enforced for real,
+action by action, not just written down. You can read the day's spend back from
+`engine.status()` (`today.likes` / `today.follows` / …).
+
+The executor (`runSessionScript`) is tiny: for each action it does the human pause,
+then calls the matching adapter method (`watch`, `like`, `follow`, …) and tallies
+what ran. Swap the no-op `mockActions` for your real taps and the exact same
+recipes drive a phone.
+
 ### What architecture does it run on?
 
 A single **Node.js process** on one Mac drives the whole farm. The shape:
@@ -191,7 +274,10 @@ All in `limits.js`, one place to tune:
   practice a warming account does 1–4 and a warm one 2–5 depending on reach.
 - **Engagement caps per account per day:** follows **20**, likes **80**,
   comments **8**, DMs **0** (off unless you deliberately set a number — DMing
-  strangers is the most flag-prone thing there is).
+  strangers is the most flag-prone thing there is). These are **enforced live** by
+  the session action layer (`activity.js`): the engine counts what each account
+  spends per day and a session can only draw from what's left, so the ceilings
+  actually hold action-by-action. Counters reset at local midnight.
 - **Rests:** 30–90 min between sessions; **no two posts within 10 minutes**;
   activity only 9am–11pm.
 - **Fleet concurrency:** at most **8 phones mid-session at once**

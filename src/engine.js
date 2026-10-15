@@ -25,6 +25,7 @@ import { planDay } from './sessions.js';
 import { scheduleIntoNextSlot, autoSchedule, calendarView } from './calendar.js';
 import { tick as postingTick, postingNow } from './posting.js';
 import { reachTier, postsPerDay, CAPS } from './limits.js';
+import { buildSessionScript, runSessionScript, sessionBudget, summariseScript, mockActions } from './activity.js';
 import { writeJsonAtomic, readJsonSafe } from './store.js';
 
 const dayKey = (now) => { const d = new Date(now); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
@@ -32,10 +33,21 @@ let _seq = 0;
 const nextId = (prefix) => `${prefix}_${Date.now().toString(36)}_${(_seq++).toString(36)}`;
 
 export class CalendarEngine {
-  // opts: { dataFile?, onSession?, onPost?, rand?, now? }
+  // opts: { dataFile?, onSession?, onPost?, actions?, rand?, now? }
+  //   actions:   your device adapter (activity.js) — the ~9 primitive taps. When
+  //              given, the DEFAULT onSession runs each session's recipe against
+  //              it. Omit it and sessions run against a no-op mock (so the kit
+  //              works with no phone). Ignored if you pass your own onSession.
   constructor(opts = {}) {
     this.dataFile = opts.dataFile || null;
-    this.onSession = opts.onSession || ((acct, s) => console.log(`[session] ${acct.label}: ${s.label} (${s.durationMin}m)`));
+    this.actions = opts.actions || mockActions;
+    // Default session handler: EXECUTE the session's action recipe (activity.js)
+    // against the device adapter. session.script is built per-fire in tick().
+    this.onSession = opts.onSession || (async (acct, s) => {
+      const tally = await runSessionScript(s.script, this.actions);
+      console.log(`[session] ${acct.label}: ${s.label} (${s.durationMin}m) — ${summariseScript(s.script)}`);
+      return tally;
+    });
     this.onPost = opts.onPost || ((acct, p) => { console.log(`[post] ${acct.label}: publishing ${p.id}`); return Promise.resolve(); });
     this.rand = opts.rand || Math.random;
     this.state = { accounts: {}, posts: {} };
@@ -131,18 +143,31 @@ export class CalendarEngine {
   async tick(now = Date.now()) {
     // 1) sessions — make sure each account has today's plan, fire what's due.
     for (const a of this.accounts()) {
-      if (!a.plan || a.plan.day !== dayKey(now)) {
-        a.plan = { day: dayKey(now), sessions: planDay(a, { now, views: this._signalViews(a), rand: this.rand }), firedIdx: -1 };
+      const today = dayKey(now);
+      if (!a.plan || a.plan.day !== today) {
+        a.plan = { day: today, sessions: planDay(a, { now, views: this._signalViews(a), rand: this.rand }), firedIdx: -1 };
       }
+      if (!a.usage || a.usage.day !== today) a.usage = { day: today, likes: 0, follows: 0, comments: 0 }; // caps reset daily
       if (this._sessionBusy.has(a.id) || postingNow().includes(a.id)) continue; // phone busy
       const idx = a.plan.sessions.findIndex((s, i) => i > a.plan.firedIdx && new Date(s.at).getTime() <= now);
       if (idx < 0) continue;
       const session = a.plan.sessions[idx];
       a.plan.firedIdx = idx;
       if (session.once && session.type === 'set_link_in_bio') a.linkInBioSet = true; // one-off, never re-scheduled
+
+      // Expand the session into its concrete action recipe, budgeted by what the
+      // account has left under today's caps, then bill the plan against the daily
+      // counters so a later session this day sees the reduced budget.
+      const phase = warmupPhase(a, now);
+      const script = buildSessionScript(a, session, { phase, budget: sessionBudget(a.usage), rand: this.rand, now });
+      a.usage.likes += script.planned.like;
+      a.usage.follows += script.planned.follow;
+      a.usage.comments += script.planned.comment;
+      const fired = { ...session, script };
+
       this._sessionBusy.add(a.id);
       Promise.resolve()
-        .then(() => this.onSession(a, session))
+        .then(() => this.onSession(a, fired))
         .catch((e) => console.warn(`[session] ${a.label}: ${session.label} failed — ${e && (e.message || e)}`))
         .finally(() => { this._sessionBusy.delete(a.id); this._save(); });
     }
@@ -170,6 +195,11 @@ export class CalendarEngine {
         postsLive: a.postsLive, linkInBioSet: a.linkInBioSet,
         calendar: calendarView(this.postsFor(a.id), a, { now }),
         todaysPlan: (a.plan && a.plan.day === dayKey(now)) ? a.plan.sessions : [],
+        // engagement spent today vs the daily caps (counters reset each day).
+        today: (a.usage && a.usage.day === dayKey(now))
+          ? { likes: a.usage.likes, follows: a.usage.follows, comments: a.usage.comments }
+          : { likes: 0, follows: 0, comments: 0 },
+        caps: { likes: CAPS.likes, follows: CAPS.follows, comments: CAPS.comments, posts: CAPS.posts },
       };
     });
   }

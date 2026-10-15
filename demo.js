@@ -8,18 +8,28 @@
 // Nothing here touches a real device — onSession/onPost just tally what happened.
 
 import { CalendarEngine } from './src/engine.js';
+import { runSessionScript, mockActions } from './src/activity.js';
 
 const DAY = 86400000;
 const flush = () => new Promise((r) => setTimeout(r, 0)); // let posting promises settle
 
 // Count what fires, per account, each simulated day.
 let tally = {};
-const bump = (id, k) => { (tally[id] ||= { sessions: 0, posts: 0, link: false }); tally[id][k] = k === 'link' ? true : tally[id][k] + 1; };
+const slot = (id) => (tally[id] ||= { sessions: 0, posts: 0, likes: 0, follows: 0, link: false });
+const bump = (id, k) => { const t = slot(id); t[k] = k === 'link' ? true : t[k] + 1; };
 
 const engine = new CalendarEngine({
   // deterministic-ish randomness so the demo reads the same-ish each run
   rand: (() => { let s = 42; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff; })(),
-  onSession: (a, s) => { bump(a.id, 'sessions'); if (s.type === 'set_link_in_bio') bump(a.id, 'link'); },
+  // Run the session's real action recipe (activity.js) against the no-op device,
+  // and tally the engagement it produced — so the likes/follows columns below are
+  // what the sessions actually did, not just a plan.
+  onSession: async (a, s) => {
+    bump(a.id, 'sessions');
+    if (s.type === 'set_link_in_bio') bump(a.id, 'link');
+    const did = await runSessionScript(s.script, mockActions);
+    const t = slot(a.id); t.likes += did.liked; t.follows += did.followed;
+  },
   onPost: (a) => { bump(a.id, 'posts'); return Promise.resolve(); },
 });
 
@@ -31,8 +41,8 @@ for (const acct of [A, B, C]) for (let i = 0; i < 12; i++) engine.addPost({ acco
 
 console.log('Warm-up windows (days):',
   engine.accounts().map((a) => `${a.label} ${Math.round((a.warmReadyAt - a.warmStartedAt) / DAY)}`).join('  '));
-console.log('\nday  acct   warmup           tier        sessions  posts');
-console.log('---  ----   ---------------  ----------  --------  -----');
+console.log('\nday  acct   warmup           tier        sessions  posts  likes  follows');
+console.log('---  ----   ---------------  ----------  --------  -----  -----  -------');
 
 for (let day = 0; day < 22; day++) {
   tally = {};
@@ -51,7 +61,7 @@ for (let day = 0; day < 22; day++) {
   }
   const st = engine.status(dayStart + DAY - 1);
   for (const s of st) {
-    const t = tally[s.id] || { sessions: 0, posts: 0, link: false };
+    const t = tally[s.id] || { sessions: 0, posts: 0, likes: 0, follows: 0, link: false };
     const warm = s.warmup.ready ? 'posting' : `warming ${s.warmup.dayOf}/${s.warmup.totalDays}`;
     console.log(
       String(day + 1).padStart(3), ' ',
@@ -59,7 +69,9 @@ for (let day = 0; day < 22; day++) {
       warm.padEnd(15), ' ',
       s.tier.padEnd(10), ' ',
       String(t.sessions).padStart(6), '  ',
-      String(t.posts).padStart(4),
+      String(t.posts).padStart(4), '  ',
+      String(t.likes).padStart(4), '  ',
+      String(t.follows).padStart(5),
       t.link ? '  ← link-in-bio set' : (s.flagged ? '  (flagged → recovery)' : ''),
     );
   }
